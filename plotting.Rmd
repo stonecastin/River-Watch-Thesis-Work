@@ -1,0 +1,788 @@
+```{r packages step 1, include=FALSE}
+#load in required libraries
+library(readr)
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+library(cluster)
+library(ggrepel)
+library(gridExtra)
+library(grid)
+library(gtable)
+library(plotly)
+library(ggfortify)
+
+#mice and factoextra require an additional step
+```
+
+```{r packages step 2, include=FALSE, cache = TRUE}
+#complete load in of mice and factoextra
+library(mice)
+library(factoextra)
+
+
+```
+
+```{r load data}
+#load in cleaned up csv
+#arranged all data in observation: characteristic format
+compiledRWdataset <- read_csv("compiledRWdataset.csv")
+
+qgisstats <- read_csv("catchmentsfulldata.csv")
+
+siteposition <- read_csv("siteposition.csv")
+
+```
+```{r create dponlyset}
+#remove all obs without dp measurement
+dponlyset <- subset(compiledRWdataset, dissolved_phosphorus>0)
+
+head(dponlyset)
+
+summary(dponlyset)
+
+```
+
+```{r dataset exploration}
+
+#Investigation of compiledRWdataset and dponlyset to find any string values (ex. <5) that need to be replaced
+#examining datasets (run each command in the shell to see individual stats)
+
+unique <- unique(compiledRWdataset[c("location", "date")])
+#4130 obs, 4130 unique combinations of station and date
+unique <- unique(dponlyset[c("location", "date")])
+#903 obs, 903 unique combinations of station and date
+unique <- unique(compiledRWdataset["dissolved_phosphorus"])
+#no strings
+unique <- unique(compiledRWdataset["total_phosphorus"])
+#strings = "< 5""<5""<0.5"
+unique <- unique(compiledRWdataset["total_nitrogen"])
+#strings = "<0.1""<0.10"
+unique <- unique(compiledRWdataset["total_suspended_solids"])
+#no strings
+unique <- unique(compiledRWdataset["turbidity"])
+#no strings
+unique <- unique(compiledRWdataset["location"])
+#Would need to fix "LFR0.5 (is this supposed to be LFB0.5)", "LFR 15.8 Discharge pipe", and many stations like "OTR7.3  BLK","OTR7.3  DUP","OTR7.3 BLK","OTR7.3 DUP" if this set were to be used in analysis
+unique <- unique(dponlyset["location"])
+#many stations need fixing; "LFR0.5 (is this supposed to be LFB0.5)" needs to be manually changed to "LFB0.5", others need to be split after a space ex."LFR23.9 Lab filtered"
+
+
+timeandplace <- c("location","date")
+#grouping by date and location to search for duplicate entries
+unique <- dponlyset %>%
+  group_by(across(all_of(timeandplace))) %>%
+  summarize(count = n_distinct(dissolved_phosphorus,total_nitrogen,total_phosphorus,turbidity,total_suspended_solids))
+#45 duplicated instances of a specific time and location, from 2 to 32 instances of duplication. 
+#Data problem: each duplicated instance is unique from the other, unable to determine which is the "correct" instance
+#2016-2017 were the culprits, with some instances of multiple recordings for the same variable on the same date. However, not all of the dates with duplicate instances have that issue. 
+
+
+```
+
+
+```{r replacing string values}
+#replacing string values with equivalent numbers (half of cut off)
+
+dponlyset['total_phosphorus'][dponlyset['total_phosphorus'] == '< 5' | dponlyset['total_phosphorus'] == '<5'] <- '2.5'
+dponlyset['total_phosphorus'][dponlyset['total_phosphorus'] == '<0.5'] <- '0.25'
+dponlyset['total_nitrogen'][dponlyset['total_nitrogen'] == '<0.1' | dponlyset['total_nitrogen'] == '<0.10'] <- '0.5'
+
+#fixing error
+dponlyset['location'][dponlyset['location'] == 'LFR0.5 (is this supposed to be LFB0.5)'] <- 'LFB0.5'
+#cutting off location strings from and including the first space, this concatenates strings from ex. "LFR23.9 Lab filtered" to "LFR23.9"
+dponlyset$location <- sub(" .+", "", dponlyset$location)
+
+
+#checking unique to see if replacement worked
+unique <- unique(dponlyset["total_phosphorus"])
+unique <- unique(dponlyset["total_nitrogen"])
+#no more string entries; replacement worked
+unique <- unique(dponlyset["location"])
+#no more erroneous station names, 56 unique stations in total
+
+
+dponlyset <- transform(dponlyset, total_phosphorus = as.numeric(total_phosphorus),
+          total_nitrogen = as.numeric(total_nitrogen))
+
+#changing total_phosphorus and total_nitrogen into numeric
+
+summary(dponlyset)
+
+```
+
+```{r creating day month and year and dp% collumns}
+
+dponlyset = dponlyset %>%
+  mutate(datefix = strptime(dponlyset$date, format = "%m/%d/%y")) %>%
+           mutate_at(vars(datefix), funs(month, day, year))
+          #"date" from char to r readable format, then to three separate columns
+
+#percent dissolved phosphorus, the fraction of TP that DP takes up
+dponlyset = dponlyset %>%
+  mutate(pctdp = (dissolved_phosphorus/total_phosphorus)*100)
+#ranges from 4.558% to 960%, with 162 entries above 100%
+#%DP should never be above 100%, as TP should be DP plus the particulate phosphorus...
+
+
+head(dponlyset)
+summary(dponlyset)
+```
+
+```{r removing duplicate instances}
+
+dponlyset$timeandplace <- paste(dponlyset$location, dponlyset$datefix, sep="_")
+
+timeandplace = c("location","datefix")
+#creating duplicate count to prepare for a join
+duplicatecount <- dponlyset %>%
+  group_by(across(all_of(timeandplace))) %>%
+  summarize(count = n_distinct(dissolved_phosphorus,total_nitrogen,total_phosphorus,turbidity,total_suspended_solids))
+#same code as unique earlier, counts the number of unique instances of a date and location (should only be one each, duplicates need to be removed)
+duplicatecount$timeandplace <- paste(duplicatecount$location, duplicatecount$datefix, sep="_")
+duplicatecount <- subset(duplicatecount,select=c(count,timeandplace))
+
+
+#joining dponlyset with duplicate count
+dponlyset <- left_join(dponlyset, duplicatecount, by = "timeandplace",)
+#removing duplicate instances
+dponlyset <- dponlyset[dponlyset$count == 1, ]
+#dropping count collumn
+drop <- c("count")
+dponlyset = dponlyset[,!(names(dponlyset) %in% drop)]
+
+#can re run unique code to check
+#unique <- dponlyset %>%
+#  group_by(across(all_of(timeandplace))) %>%
+#  summarize(count = n_distinct(dissolved_phosphorus,total_nitrogen,total_phosphorus,turbidity,total_suspended_solids))
+
+#814 obs remaining in dponlyset
+
+```
+
+
+```{r join with QGIS and siteposition data}
+
+#joining the prepped data with additional data gathered by QGIS
+
+#standardizing station names with dponlyset standard
+qgisstats$LaRosaSi_1 <- sub(" .+", "", qgisstats$LaRosaSi_1) 
+siteposition$LaRosaSiteID <- sub(" .+", "", siteposition$LaRosaSiteID)
+
+#station typos: 
+#"LFR4" is not a valid station name, LCT4 is, and LFR3.7 is, "LFR4" obs must be removed since actual station is indeterminable
+
+#"LCT3-3.9" is a valid station name, but not collected in qgisstats 
+#"LCKLW0.1" is a valid station name, "LCHLW1.0" is not, "LCKLW0.1" is not included in qgisstats 
+
+#removing a station typo and another station not found in QGIS data
+dponlyset <- dponlyset[!(dponlyset$location=="LCHLW1.0"),]
+dponlyset <- dponlyset[!(dponlyset$location=="LCKLW0.1"),]
+dponlyset <- dponlyset[!(dponlyset$location=="LCHLW0.1"),]
+dponlyset <- dponlyset[!(dponlyset$location=="LFR4"),]
+
+
+#join QGIS and siteposition data with dponlyset
+dponlyset <- dponlyset %>%
+  left_join(qgisstats, by = c("location" = "LaRosaSi_1"))
+dponlyset <- dponlyset %>%
+  left_join(siteposition, by = c("location" = "LaRosaSiteID"))
+
+
+```
+
+
+```{r removing 20% of points for test set}
+#creates a set of 20% of randomly selected obs from dponlyset that will be an accuracy test for linear models created later
+#set seed so that the randomly selected obs are the same obs each time the code is run
+set.seed(2484)
+dptestset <- dponlyset[sample(nrow(dponlyset), (nrow(dponlyset))*0.2), ]
+
+#setting up a check that the entries were removed
+total = nrow(dponlyset)
+
+#remove entries from dponlyset that match entries in dptestset
+dp80set <- anti_join(dponlyset, dptestset, by="timeandplace")
+
+
+```
+
+
+```{r}
+#mice imputation prep
+
+#changing location from char to factor (location factor turned out to be unwielldy to use)
+miceprep <- dp80set %>%
+  mutate(location = as.factor(location)) 
+miceprepkmeans <- dponlyset
+#removing date and datefix 
+miceprep <- subset(miceprep, select = -c(datefix,date))
+miceprepkmeans <- subset(miceprepkmeans, select = -c(datefix,date))
+  
+head(miceprep)
+
+```
+
+
+```{r mice imputation}
+#preforming the mice imputation
+#"area" (col. 12) for some reason throws an error, not sure why
+imputeddponly <- mice(miceprep %>% 
+                          filter(location != "LFR4") %>%
+                          select(1:11,13:19), m = 5, method = 'pmm', seed = 500) 
+
+summary(imputeddponly)
+head(imputeddponly)
+
+miceddp <- complete(imputeddponly, 2)
+
+imputeddponlykmeans <- mice(miceprepkmeans %>% 
+                        filter(location != "LFR4") %>%
+                        select(1:11,13:19), m = 5, method = 'pmm', seed = 500) 
+
+micedkmeans <- complete(imputeddponlykmeans, 2)
+
+
+```
+
+```{r}
+#lm for miceddp
+
+dpsinglemodel <- lm(dissolved_phosphorus ~ total_phosphorus + turbidity + total_suspended_solids + total_nitrogen + month + year + pctnat + pctag + ORDER_CELL + elevavg + streamposition, data = miceddp)
+
+summary(dpsinglemodel)
+
+
+
+```
+
+```{r different configuration of lm: test for redundant variables 1}
+#different configuration of lm: test for redundant variables 1
+
+#removing avg elevation and stream order (ORDERCELL) to test stream position for sig.
+dpordermodel <- lm(dissolved_phosphorus ~ total_phosphorus + turbidity + total_suspended_solids + total_nitrogen + month + day + year + pcturban + pctnat + pctag + streamposition, data = miceddp)
+
+summary(dpordermodel)
+#streamposition decreases in significance
+```
+
+```{r different configuration of lm: test for redundant variables 2}
+#different configuration of lm: test for redundant variables 2
+
+#removing pct urban and pct nat to test pct ag for significance
+dpagmodel <- lm(dissolved_phosphorus ~ total_phosphorus + turbidity + total_suspended_solids + total_nitrogen + month + day + year + pctag + ORDER_CELL, data = miceddp)
+
+summary(dpagmodel)
+#pct ag jumps up in significance to 1.53e-05 from 0.00117
+```
+
+```{r}
+
+#create a pooled model, step one build the model with a multiple linear regression
+
+
+dpmodelimputed <- lm(dissolved_phosphorus ~ total_phosphorus + turbidity + total_suspended_solids + total_nitrogen + year + pctag, data = miceddp)
+
+dpmodelimputedwqonly <- lm(dissolved_phosphorus ~ total_phosphorus + turbidity + total_suspended_solids, data = miceddp)
+summary(dpmodelimputedwqonly)
+
+
+
+
+```
+
+```{r testing accuracy of model using dptestset}
+
+#predicting DP for usable obs in dptestset
+dptestset <- na.omit(dptestset)
+dptestset$pred <-predict(dpmodelimputed, dptestset)
+dptestset$predwq <-predict(dpmodelimputedwqonly, dptestset)
+
+#finding mean squared error of predictions
+dptestset$error <- (dptestset$dissolved_phosphorus - dptestset$pred)^2
+dptestset$errorwq <- (dptestset$dissolved_phosphorus - dptestset$predwq)^2
+print(mean(dptestset$error))
+print(mean(dptestset$errorwq))
+
+p <- dptestset %>%
+  ggplot(aes(x = dissolved_phosphorus, y = pred)) +
+  geom_point(aes(color = error))
+p + labs(x = "actual DP (ug/l)", y = "predicted DP (ug/l)", title = "watershed predicted values", color = "mean sq error") +  geom_abline(slope=1)
+
+
+
+p <- dptestset %>%
+  ggplot(aes(x = dissolved_phosphorus, y = predwq)) +
+  geom_point(aes(color = errorwq))
+p + labs(x = "actual DP (ug/l)", y = "predicted DP (ug/l)", title = "water quality predicted values", color = "mean sq error") +  geom_abline(slope=1)
+
+
+```
+
+
+```{r grouping by station}
+#grouping by station
+stationavg <- dponlyset %>% group_by(location) %>% 
+  summarise(tpavg = mean(total_phosphorus),
+            dpavg = mean(dissolved_phosphorus),
+            tnavg = mean(total_nitrogen),
+            turbavg = mean(turbidity),
+            tssavg = mean(total_suspended_solids),
+            pctdpmean = mean(pctdp))
+#72 stations carried over
+
+#re-joining site stats
+stationavg <- stationavg %>%
+  left_join(siteposition, by = c("location" = "LaRosaSiteID"))
+stationavg <- stationavg %>%
+  left_join(qgisstats, by = c("location" = "LaRosaSi_1"))
+
+#grouping by location and month, so monthly average for each station (hopefully)
+monthandplace <- c("location", "month")
+
+stationmonthlyavg <- dponlyset %>% group_by(across(all_of(monthandplace))) %>% 
+  summarise(tpavg = mean(total_phosphorus),
+            dpavg = mean(dissolved_phosphorus),
+            tnavg = mean(total_nitrogen),
+            turbavg = mean(turbidity),
+            tssavg = mean(total_suspended_solids),
+            pctdpmean = mean(pctdp))
+
+#rejoining site stats
+stationmonthlyavg <- stationmonthlyavg %>%
+  left_join(siteposition, by = c("location" = "LaRosaSiteID"))
+stationmonthlyavg <- stationmonthlyavg %>%
+  left_join(qgisstats, by = c("location" = "LaRosaSi_1"))
+
+
+
+##grouping with imputed dataset
+
+#grouping by station
+micedstationavg <- micedkmeans %>% group_by(location) %>% 
+  summarise(tpavg = mean(total_phosphorus),
+            dpavg = mean(dissolved_phosphorus),
+            tnavg = mean(total_nitrogen),
+            turbavg = mean(turbidity),
+            tssavg = mean(total_suspended_solids),
+            pctdpmean = mean(pctdp))
+#72 stations carried over
+
+#re-joining site stats
+micedstationavg <- micedstationavg %>%
+  left_join(siteposition, by = c("location" = "LaRosaSiteID"))
+micedstationavg <- micedstationavg %>%
+  left_join(qgisstats, by = c("location" = "LaRosaSi_1"))
+
+#grouping by location and month, so monthly average for each station (hopefully)
+monthandplace <- c("location", "month")
+
+micedstationmonthlyavg <- micedkmeans %>% group_by(across(all_of(monthandplace))) %>% 
+  summarise(tpavg = mean(total_phosphorus),
+            dpavg = mean(dissolved_phosphorus),
+            tnavg = mean(total_nitrogen),
+            turbavg = mean(turbidity),
+            tssavg = mean(total_suspended_solids),
+            pctdpmean = mean(pctdp))
+
+#rejoining site stats
+micedstationmonthlyavg <- micedstationmonthlyavg %>%
+  left_join(siteposition, by = c("location" = "LaRosaSiteID"))
+micedstationmonthlyavg <- micedstationmonthlyavg %>%
+  left_join(qgisstats, by = c("location" = "LaRosaSi_1"))
+
+
+
+```
+
+```{r count of NAs per station}
+
+stationsummary <- dponlyset %>%
+	group_by(location) %>%
+	summarise(TPna = sum(is.na(total_phosphorus)),
+	          DPna = sum(is.na(dissolved_phosphorus)),
+	          TNna = sum(is.na(total_nitrogen)),
+	          Turbna = sum(is.na(turbidity)),
+	          TSSna = sum(is.na(total_suspended_solids)))
+
+
+monthandplace <- c("location", "month")
+  
+stationmonthlysummary <-dponlyset %>%
+	group_by(across(all_of(monthandplace))) %>%
+	summarise(TPna = sum(is.na(total_phosphorus)),
+	          DPna = sum(is.na(dissolved_phosphorus)),
+	          TNna = sum(is.na(total_nitrogen)),
+	          Turbna = sum(is.na(turbidity)),
+	          TSSna = sum(is.na(total_suspended_solids)))
+
+
+#create a table of station NA values
+
+pdf(file = "stationNA.pdf", height = 16, width = 8)
+grid.newpage()
+colnames(stationsummary) <- c("Station", "Total\nPhosphorus \nN/A", "Dissolved \nPhosphorus\nN/A", "Total \nNitrogen\nN/A", "Turbidity/nN/A", "Total\nSuspended\nSolids\nN/A")
+grid.table(stationsummary)
+dev.off()
+
+#create a table of station cluster values
+
+stationclusters <- select(micedstationavg,1,16)
+view(stationclusters)
+
+pdf(file = "stationclusters.pdf", height = 15, width = 4)
+grid.newpage()
+colnames(stationclusters) <- c("Station", "Cluster\nAssignment")
+grid.table(stationclusters)
+dev.off()
+
+
+summary(stationmonthlysummary)
+
+
+```
+
+
+```{r kmeans prep}
+
+#hi um, do I want to do the kmeans analysis on the imputed set? hello????? Q for Lyford (to find this block later)
+
+#k-means prep
+#setting up kmeans so that there are five numeric columns of water quality variables
+k_means <- micedkmeans
+k_means <- k_means[c(2:6)]
+k_means <- na.omit(k_means)
+
+
+k_means[] <- as.numeric(unlist(k_means))
+k_means <- scale(k_means)
+head(k_means)
+
+#kmeans prep for station clusters
+k_meansstation <- micedstationavg
+k_meansstation <- k_meansstation[c(2:6)]
+k_meansstation <- na.omit(k_meansstation)
+
+
+k_meansstation <- scale(k_meansstation)
+#this works, but they no longer have an ID tag, df is still in the same order
+head(k_meansstation)
+
+#kmeans prep for monthly avg per stations 
+k_meansmonthly <- micedstationmonthlyavg
+k_meansmonthly <- k_meansmonthly[c(3:7)]
+k_meansmonthly <- na.omit(k_meansmonthly)
+
+
+k_meansmonthly <- scale(k_meansmonthly)
+#this works, but they no longer have an ID tag, df is still in the same order
+head(k_meansmonthly)
+
+```
+
+
+```{r optimal clusters analysis}
+#finding the optimal number of clusters for dponly kmeans
+
+fviz_nbclust(k_means, kmeans, method = "wss")
+#finding the "elbow" at 6
+
+
+#finding the optimal number of clusters for station kmeans
+
+fviz_nbclust(k_meansstation, kmeans, method = "wss")
+#finding the "elbow" at 6
+
+
+#finding the optimal number of clusters for monthly avg kmeans
+
+fviz_nbclust(k_meansmonthly, kmeans, method = "wss")
+#finding the "elbow" at 6
+
+```
+
+```{r kmeans analysis, include=FALSE}
+#k-means analysis for complete dataset
+km <- kmeans(k_means, centers = 6, nstart = 25)
+km
+
+#kmeans analysis for stations
+km2 <- kmeans(k_meansstation, centers = 6, nstart = 25)
+km2
+
+#kmeans analysis for monthly averages
+km3 <- kmeans(k_meansmonthly, centers = 6, nstart = 25)
+km3
+
+
+#change matricies to df and add cluster assignment as variable "cluster"
+k_means <- data.frame(k_means) %>%
+  mutate(cluster = km$cluster %>% as.vector())
+k_meansstation <- data.frame(k_meansstation) %>%
+  mutate(cluster = km2$cluster %>% as.vector())
+k_meansmonthly <- data.frame(k_meansmonthly) %>%
+  mutate(cluster = km3$cluster %>% as.vector())
+
+
+```
+
+```{r rejoining clusters to main dataset}
+
+
+micedkmeans <- cbind(micedkmeans, cluster = k_means$cluster)
+micedstationavg <- cbind(micedstationavg, cluster = k_meansstation$cluster)
+micedstationmonthlyavg <- cbind(micedstationmonthlyavg, cluster = k_meansmonthly$cluster)
+
+
+```
+
+
+```{r}
+#visualizing results using principle componnent analysis
+
+#removing na values from miceddp
+micedkmeans <- na.omit(micedkmeans)
+#pca for imputed dponlyset
+dponlyset.pca <- prcomp(micedkmeans[,c(-1,-11,-17,-19)], center = TRUE,scale. = TRUE)
+print(dponlyset.pca)
+
+
+
+p <- autoplot(dponlyset.pca, data = micedkmeans, colour = 'outlet')
+
+ggplotly(p)
+
+
+#removing na values from micedstationavg
+micedstationavg <- na.omit(micedstationavg)
+#pca for imputed station averages
+stationavg.pca <- prcomp(micedstationavg[,c(-1,-8,-16)], center = TRUE,scale. = TRUE)
+print(stationavg.pca)
+
+p <- autoplot(stationavg.pca, data = micedstationavg, colour = 'outlet',
+              loadings = TRUE, loadings.colour = 'blue',
+              loadings.label = TRUE, loadings.label.size = 3)
+
+ggplotly(p)
+
+#removing na values from micedmonthlystationavg
+micedstationmonthlyavg <- na.omit(micedstationmonthlyavg)
+#pca for imputed monthly station averages
+stationmonthlyavg.pca <- prcomp(micedstationmonthlyavg[,c(-1,-9,-17)], center = TRUE,scale. = TRUE)
+print(stationmonthlyavg.pca)
+
+p <- autoplot(stationmonthlyavg.pca, data = micedstationmonthlyavg, colour = 'outlet',
+              loadings = TRUE, loadings.colour = 'blue',
+              loadings.label = TRUE, loadings.label.size = 3)
+
+ggplotly(p)
+
+
+
+```
+
+
+```{r plots for dponlyset}
+
+
+p <- dponlyset %>%
+  ggplot(aes(x = month, y = dissolved_phosphorus)) +
+  geom_point(aes(color = year))
+p + labs(y="dissolved phosphorus ug/l", title = "Seasonal Phosphorus Fluctuation (dissolved)") + theme(plot.title = element_text(size=12)) + scale_x_continuous(breaks=c(1,3,5,7,9,11))+ scale_y_continuous(expand = c(0, 0))
+
+p <- dponlyset %>%
+  ggplot(aes(x = month, y = total_phosphorus)) +
+  geom_point(aes(color = year))
+p + labs(y="total phosphorus ug/l", title = "Seasonal Phosphorus Fluctuation (total)")
+
+unique %>%
+  ggplot(aes(x = tpavg, y = pctdpmean)) +
+  geom_point(aes(color = `km2$cluster`))
+
+
+unique <- dponlyset[dponlyset$location == "LFR0", ]
+unique <- unique[unique$month == "7", ]
+p <- unique %>%
+  ggplot(aes(x = year, y = dissolved_phosphorus)) +
+  geom_point()
+p + labs(y = "dissolved phosphorus ug/l", title = "LFR0 July Measurements (DP)") + geom_point() +
+    geom_smooth(method=lm, se=FALSE)
+p <- unique %>%
+  ggplot(aes(x = year, y = total_phosphorus)) +
+  geom_point()
+p + labs(y = "total phosphorus ug/l", title = "LFR0 July Measurements (TP)") + geom_point() +
+    geom_smooth(method=lm, se=FALSE)
+
+
+
+```
+
+
+```{r kmeans plots}
+#change cluster from numeric to factor, as clusters are not related to one another numerically
+micedkmeans <- micedkmeans %>%
+  mutate(cluster = factor(cluster))
+micedstationavg <- micedstationavg %>%
+  mutate(cluster = factor(cluster))
+micedstationmonthlyavg <- micedstationmonthlyavg %>%
+  mutate(cluster = factor(cluster))
+
+
+#yearly station averages, tp vs dp, turb vs dp, and tss vs dp
+p <- micedstationavg %>%
+  ggplot(aes(x = tpavg, y = dpavg)) +
+  geom_point(aes(color = as.factor(cluster))) #+
+#  geom_label_repel(aes(label = location))
+p + labs(x = "total phosphorus ug/l", y = "dissolved phosphorus ug/l", title ="Station Averages:
+dissolved vs total phosphorus", color = "cluster")
+
+p <- micedstationavg %>%
+  ggplot(aes(x = turbavg, y = dpavg)) +
+  geom_point(aes(color = as.factor(cluster)))
+p + labs(x = "turbidity NTU", y = "dissolved phosphorus ug/l", title ="Station Averages:
+dissolved phosphorus vs turbidity", color = "cluster")
+
+p <- micedstationavg %>%
+  ggplot(aes(x = tssavg, y = dpavg)) +
+  geom_point(aes(color = as.factor(cluster)))
+p + labs(x = "total suspended solids mg/l", y = "dissolved phosphorus ug/l", title ="Station Averages:
+dissolved phosphorus vs TSS", color = "cluster")
+
+p <- micedstationavg %>%
+  ggplot(aes(x = pctag, y = dpavg)) +
+  geom_point(aes(color = as.factor(cluster)))
+p + labs(x = "percent agricultural land", y = "dissolved phosphorus ug/l", title ="Station Averages:
+dissolved phosphorus vs land use", color = "cluster")
+
+
+#complete dataset, tp vs dp, turb vs dp, and tss vs dp
+p <- micedkmeans %>%
+  ggplot(aes(x = total_phosphorus, y = dissolved_phosphorus)) +
+  geom_point(aes(color = as.factor(cluster))) #+
+#  geom_label_repel(aes(label = location))
+p + labs(x = "total phosphorus ug/l", y = "dissolved phosphorus ug/l", title ="All Observations:
+dissolved vs total phosphorus", color = "cluster")
+
+
+p <- micedkmeans %>%
+  ggplot(aes(x = turbidity, y = dissolved_phosphorus)) +
+  geom_point(aes(color = as.factor(cluster)))
+p + labs(x = "turbidity NTU", y = "dissolved phosphorus ug/l", title ="All Observations:
+dissolved phosphorus vs turbidity", color = "cluster")
+
+p <- micedkmeans %>%
+  ggplot(aes(x = total_suspended_solids, y = dissolved_phosphorus)) +
+  geom_point(aes(color = as.factor(cluster)))
+p + labs(x = "total suspended solids mg/l", y = "dissolved phosphorus ug/l", title ="All obs:
+dissolved phosphorus vs TSS", color = "cluster")
+
+
+
+```
+
+
+```{r TP DP directional analysis}
+
+#plot (DP/TP) by year, subset by month,
+
+#OPTIONAL: load all plots subset by month and stations(50x12 plots)
+
+# dponlyset %>%
+#   sample_n(1000, replace=TRUE) %>%
+#   ggplot() +
+#   geom_point(aes(x = year, y = dissolved_phosphorus)) +
+#   geom_smooth(aes(x = year, y = dissolved_phosphorus), method = dpsinglemodel) +
+#   facet_grid(month ~ location)
+
+#ok that worked just fine however: the interface isn't made to look at like 50x12 plots at once
+```
+
+
+```{r collecting monthly trends per station}
+
+#return a matrix of slopes for each station each month
+
+#cleaning up, remove all rows w N/A entries
+dponlycomplete <- na.omit(dponlyset) 
+
+#vector of variables to subset by
+subset_by <- c("month", "location")
+
+#return a df of slopes (and r^ values) for each station each month
+
+dprslope <- dponlycomplete %>%
+  group_by(across(all_of(subset_by))) %>%
+  summarize(slope = lm(year~dissolved_phosphorus)$coefficients[2],
+            r2 = summary(lm(year~dissolved_phosphorus))$r.sq)
+
+tprslope <- dponlycomplete %>%
+  group_by(across(all_of(subset_by))) %>%
+  summarize(slope = lm(year~total_phosphorus)$coefficients[2],
+            r2 = summary(lm(year~total_phosphorus))$r.sq)
+
+```
+
+```{r isolating trend}
+
+#change slope values to [1, 0 , -1] using replace()
+
+
+dpslopedirection <- replace(dprslope$slope, dprslope$slope<0,-1)
+dpslopedirection <- replace(slopedirection, slopedirection>0,1)
+
+tpslopedirection <- replace(tprslope$slope, tprslope$slope<0,-1)
+tpslopedirection <- replace(slopedirection, slopedirection>0,1)
+
+
+#subtract TPs - DPs
+comparedslopes <- tpslopedirection - dpslopedirection
+
+summary(comparedslopes)
+
+#all 0, so tp and dp always move in the same direction
+
+```
+
+```{r upstream analysis}
+#plotting 
+
+t <- stationavg %>%
+  ggplot(aes(x = streamposition, y = dpavg)) +
+  geom_point(aes(color = ORDER_CELL)) + 
+  xlim(22, 1) +
+  theme(aspect.ratio = 1)
+
+t + facet_wrap(vars(outlet)) + labs(title = "average DP by station", x = "number of stations before outlet", y = "dissolved phosphorus (ug/l)", color = "stream order")
+
+
+t <- stationavg %>%
+     ggplot(aes(x = streamposition, y = pctdpmean)) +
+     geom_point(aes(color = ORDER_CELL)) + 
+     xlim(22, 1) +
+     theme(aspect.ratio = 1)
+ 
+ t + facet_wrap(vars(outlet)) + labs(title = "average DP by station (% of TP)", x = "number of stations before outlet", y = "dissolved phosphorus (ug/l)", color = "stream order")
+ 
+
+
+
+t <- stationavg %>%
+  ggplot(aes(x = streamposition, y = dpavg)) +
+  geom_point(aes(color = ORDER_CELL)) +
+  xlim(22, 1) 
+
+t + facet_grid(rows = vars(outlet)) + labs(title = "Dissolved Phosphorus by Outlet", x = "number of stations before outlet", y = "dissolved phosphorus (ug/l)", color = "stream order")
+
+#ggplot(mpg, aes(cty, hwy)) + geom_point() 
+
+
+# dponlyset %>%
+#   sample_n(1000, replace=TRUE) %>%
+#   ggplot() +
+#   geom_point(aes(x = year, y = dissolved_phosphorus)) +
+#   geom_smooth(aes(x = year, y = dissolved_phosphorus), method = dpsinglemodel) +
+#   facet_grid(month ~ location)
+
+```
